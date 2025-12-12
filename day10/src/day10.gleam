@@ -1,8 +1,9 @@
 import gleam/deque
+import gleam/float
 import gleam/int
 import gleam/io
 import gleam/list
-import gleam/order.{Eq, Gt, Lt}
+import gleam/result
 import gleam/set
 import nibble.{Break, Continue, do, return}
 import nibble/lexer
@@ -21,7 +22,7 @@ type Token {
 }
 
 type Button {
-  Button(value: Int)
+  Button(bitmask: Int, positions: List(Int))
 }
 
 type Joltage {
@@ -34,7 +35,7 @@ type Machine {
 
 /// Find the fewest number of button presses to light the lights.
 fn find_fewest_button_presses_for_lights(machine: Machine) -> Result(Int, String) {
-  let buttons = list.map(machine.buttons, fn(button) { button.value })
+  let buttons = list.map(machine.buttons, fn(button) { button.bitmask })
   |> set.from_list()
 
   // queue elements are `#(presses, lights, buttons)`, where `presses` is the
@@ -60,117 +61,152 @@ fn bfs_button_presses_for_lights(queue: deque.Deque(#(Int, Int, set.Set(Int))), 
   }
 }
 
-/// Find the fewest number of button presses to get the joltages
+/// A "fudge" factor to account for floating point inaccuracies
+const epsilon = 1.0e-6
+const nepsilon = -1.0e-6
+
+/// Represents a linear expression in vector form
+type LinearExpression {
+  LinearExpression(coefficients: List(Float), constant: Float)
+}
+
+/// Each button is a variable
+type Variable {
+  Variable(free: Bool, expression: LinearExpression, value: Int, max_value: Int)
+}
+
+/// Find the fewest number of button presses to get the joltages. Based on:
+/// https://codeberg.org/siddfinch/aoc2025/src/branch/trunk/src/day10/Factory.pas
 fn find_fewest_button_presses_for_joltages(machine: Machine) -> Int {
-  let buttons = set.from_list(machine.buttons)
-  let joltages = list.map(machine.joltages, fn(joltage) { Joltage(..joltage, value: 0) })
-  dfs_button_presses_for_joltages(0, buttons, joltages, 999_999, machine)
-}
+  let button_len = list.length(machine.buttons)
 
-/// Depth first search.
-/// Some things to help improve performance:
-/// * On each step, sort the joltages and start with the lowest one. For each
-///   button that affects that joltage, try pushing the button exactly enough
-///   times to max that joltage and recurse. If that didn't work, backtrack to
-///   pushing that button one less time, and so on.
-/// * On recurse, remove that button entirely from consideration.
-/// * Also remove any button that would increment a joltage above the target.
-fn dfs_button_presses_for_joltages(presses: Int, buttons: set.Set(Button), joltages: List(Joltage), min_button_presses: Int, machine: Machine) -> Int {
-  case int.compare(presses, min_button_presses), set.size(buttons) {
-    // not going to get any better than min_button_presses
-    Gt, _ | Eq, _ | _, 0 -> min_button_presses
-
-    Lt, _ -> case compare_joltages(joltages, machine.joltages) {
-      // this path produced joltages that are too high - skip
-      #(Gt, _, _) -> min_button_presses
-
-      // this path produced the correct joltage
-      #(Eq, _, _) -> int.min(min_button_presses, presses)
-
-      // haven't finished yet...
-      #(Lt, remaining_joltages, mask) -> {
-        // remove any buttons that would increment a finished joltage
-        let buttons = filter_buttons_masked(buttons, mask)
-
-        // remove any joltages that are zero, then sort
-        list.filter(remaining_joltages, fn(joltage) { joltage.value > 0 })
-        |> list.sort(fn(a, b) { int.compare(a.value, b.value) })
-        |> list.fold(min_button_presses, fn(min_button_presses, joltage) {
-          // starting with the lowest remaining joltage, find buttons that will
-          // increment that joltage
-          filter_buttons_matching(buttons, joltage.bitmask)
-          |> set.fold(min_button_presses, fn(min_button_presses, button) {
-            // remove that button from consideration
-            let buttons = set.drop(buttons, [button])
-
-            // push that button enough times to max the joltage, and then
-            // backtrack down to a single push
-            list.range(joltage.value, 1)
-            |> list.fold(min_button_presses, fn(min_button_presses, add_presses) {
-              dfs_button_presses_for_joltages(add_presses + presses, buttons, increment_joltages(joltages, button, add_presses), min_button_presses, machine)
-            })
-          })
-        })
+  // Each button is a variable initialized with a vector of 0's
+  let variables = list.map(machine.buttons, fn(button) {
+    // The `max_value` of a variable cannot exceed the minimum joltage that the
+    // button affects.
+    let max_value = list.fold(machine.joltages, 999_999, fn(acc, joltage) {
+      case int.bitwise_and(button.bitmask, joltage.bitmask) != 0 {
+        True -> int.min(acc, joltage.value)
+        False -> acc
       }
-    }
-  }
-}
+    })
+    let expression = LinearExpression(list.repeat(0.0, button_len), 0.0)
+    Variable(True, expression, 0, max_value)
+  })
 
-/// Compares two joltages and returns three values. The first is an Order:
-/// - Lt if all `joltage` values are less than OR equal to the `target` values;
-/// - Eq if all `joltage` values are equal to the `target`; otherwise,
-/// - Gt if ANY `joltage` value is greater than the `target`.
-///
-/// The second is a List of Joltages representing how much joltage is left in
-/// each position. Note: if the Order is Gt, this value is meaningless.
-///
-/// The third value is a bit array where a `1` represents a position where the
-/// `joltage` value equaled the `target`, `0` otherwise. Note: if the Order is
-/// Gt, this value is meaningless.
-fn compare_joltages(joltage: List(Joltage), target: List(Joltage)) -> #(order.Order, List(Joltage), Int) {
-  case joltage, target {
-    [head1, ..rest1], [head2, ..rest2] -> case int.compare(head1.value, head2.value) {
-      Lt -> case compare_joltages(rest1, rest2) {
-        #(Gt, _, _) -> #(Gt, [], 0)
-        #(_, remaining_joltages, num) -> #(Lt, [Joltage(..head2, value: head2.value - head1.value), ..remaining_joltages], num)
+  // Each joltage has an equation where coefficients correspond to buttons: a 1
+  // if the button affects that joltage, or a 0 otherwise.
+  let equations = list.map(machine.joltages, fn(joltage) {
+    let coefficients = list.map(machine.buttons, fn(button) {
+      case int.bitwise_and(button.bitmask, joltage.bitmask) != 0 {
+        True -> 1.0
+        False -> 0.0
       }
-      Eq -> {
-        let #(order, remaining_joltages, num) = compare_joltages(rest1, rest2)
-        #(order, [Joltage(..head2, value: head2.value - head1.value), ..remaining_joltages], int.bitwise_or(num, head2.bitmask))
-      }
-      Gt -> #(Gt, [], 0)
-    }
-    [], [] -> #(Eq, [], 0)
-    _, _ -> #(Gt, [], 0)
-  }
-}
+    })
+    LinearExpression(coefficients, int.to_float(0 - joltage.value))
+  })
 
-fn increment_joltages(joltages: List(Joltage), button: Button, by: Int) -> List(Joltage) {
-  list.map(joltages, fn(joltage) {
-    case int.bitwise_and(joltage.bitmask, button.value) != 0 {
-      True -> Joltage(..joltage, value: joltage.value + by)
-      False -> joltage
+  // Gaussian Elimination
+  // The algo will reduce the above equations into row-echelon form, reducing
+  // the number of "free" variables, and, thus, the size of the search space
+  // that we need to consider to find the answer.
+  let #(_equations, variables) = list.zip(variables, list.range(0, list.length(variables)))
+  |> list.map_fold(equations, fn(equations, variable_with_idx) {
+    let #(variable, idx) = variable_with_idx
+    let equation = list.find(equations, fn(equation) {
+      case list.drop(equation.coefficients, idx) {
+        [coefficient, .._] if coefficient >. epsilon || coefficient <. nepsilon -> True
+        _ -> False
+      }
+    })
+    case equation {
+      Ok(equation) -> {
+        let expression = extract_variable(equation, idx)
+        let new_equations = list.map(equations, substitute_variable(_, idx, expression))
+        let new_variable = Variable(..variable, free: False, expression: expression)
+        #(new_equations, new_variable)
+      }
+      _ -> #(equations, variable)
     }
   })
+
+  // Evaluate variables in reverse. Technically, gaussian elimination can fail
+  // to find a solution. Luckily, it works for all of our input.
+  let assert Ok(result) = evaluate_variables(list.reverse(variables), [], button_len, 0)
+  result
 }
 
-/// Filters a list of buttons, keeping only the ones that match the mask.
-fn filter_buttons_matching(buttons: set.Set(Button), mask: Int) -> set.Set(Button) {
-  case mask {
-    0 -> set.new()
-    _ -> set.filter(buttons, fn(button) {
-      int.bitwise_and(button.value, mask) != 0
+/// Extract a variable from the given LinearExpression
+fn extract_variable(expression: LinearExpression, idx: Int) -> LinearExpression {
+  // A is the negated coefficient at the index
+  let assert Ok(a) = list.first(list.drop(expression.coefficients, idx))
+  |> result.map(float.negate)
+
+  // Update each coefficient by dividing by A - also update the constant
+  list.index_map(expression.coefficients, fn(coefficient, coeff_idx) {
+    case coeff_idx == idx {
+      True -> 0.0
+      False -> coefficient /. a
+    }
+  })
+  |> LinearExpression(expression.constant /. a)
+}
+
+/// Substitute a variable into a LinearExpression by basically multiplying the
+/// equation with the Variable's vector.
+fn substitute_variable(equation: LinearExpression, idx: Int, expression: LinearExpression) -> LinearExpression {
+  let assert Ok(a) = list.first(list.drop(equation.coefficients, idx))
+  list.zip(equation.coefficients, expression.coefficients)
+  |> list.index_map(fn(coefficients, coeff_idx) {
+    case coeff_idx == idx {
+      True -> 0.0
+      False -> coefficients.0 +. a *. coefficients.1
+    }
+  })
+  |> LinearExpression(equation.constant +. a *. expression.constant)
+}
+
+/// Evaluate variables to minimize button presses
+fn evaluate_variables(variables: List(Variable), values: List(Float), remaining_vals: Int, presses: Int) -> Result(Int, Nil) {
+  case variables {
+    // for free variables, try all values from 0 to max_value inclusive
+    [variable, ..variables] if variable.free -> list.fold(list.range(0, variable.max_value), Error(Nil), fn(minimum, value) {
+      case minimum, check_evaluation(variables, int.to_float(value), values, remaining_vals, presses) {
+        Ok(minimum), Ok(presses) -> Ok(int.min(minimum, presses))   // have a value, and got a new value: take minimum
+        Ok(_), Error(_) -> minimum                                  // have a value, but failed to find a new one: keep value
+        Error(_), Ok(presses) -> Ok(presses)                        // don't have value, found a new one: take new one
+        err, _ -> err                                               // don't have value, and no new one: return error
+      }
     })
+
+    // for bound variables, multiply the coefficients by values
+    [variable, ..variables] -> {
+      // pad the beginning of values with zeros so it's the same length as the
+      // coefficient list
+      let padded_values = list.append(list.repeat(0.0, remaining_vals), values)
+
+      // multiply the `values` vector with the variable's expression
+      let value = list.fold(list.zip(padded_values, variable.expression.coefficients), variable.expression.constant, fn(acc, coefficients) {
+        acc +. coefficients.0 *. coefficients.1
+      })
+      check_evaluation(variables, value, values, remaining_vals, presses)
+    }
+
+    // no more variables to evaluate, so return presses
+    _ -> Ok(presses)
   }
 }
 
-/// Filters a list of buttons, removing any match the mask.
-fn filter_buttons_masked(buttons: set.Set(Button), mask: Int) -> set.Set(Button) {
-  case mask {
-    0 -> buttons
-    _ -> set.filter(buttons, fn(button) {
-      int.bitwise_and(button.value, mask) == 0
-    })
+/// Checks if the value we calculated is valid. If it is, continue the
+/// recursion. Otherwise, return an error to end the recursion.
+fn check_evaluation(variables: List(Variable), value: Float, values: List(Float), remaining_vals: Int, presses: Int) -> Result(Int, Nil) {
+  let rounded_value = float.round(value)
+  case float.absolute_value(value -. int.to_float(rounded_value)) {
+    // if any of these conditions are true, we can quit this evaluation
+    diff if value <. nepsilon || diff >. epsilon || rounded_value < 0 -> Error(Nil)
+
+    // otherwise, continue with the recursion
+    _ -> evaluate_variables(variables, [value, ..values], remaining_vals - 1, presses + rounded_value)
   }
 }
 
@@ -225,11 +261,14 @@ pub fn main() -> Nil {
         {
           use _ <- do(nibble.take_if("startbutton", fn(tok) { tok == StartButton }))
           use positions <- do(nibble.take_until(fn(tok) { tok == EndButton }))
-          let value = list.fold(positions, 0, fn(acc, position) {
+          let positions = list.map(positions, fn(position) {
             let assert Number(position) = position
+            position
+          })
+          let bitmask = list.fold(positions, 0, fn(acc, position) {
             int.bitwise_or(acc, int.bitwise_shift_left(1, position))
           })
-          return(Continue(#(Machine(machine.lights, [Button(value), ..machine.buttons], machine.joltages), list)))
+          return(Continue(#(Machine(machine.lights, [Button(bitmask, positions), ..machine.buttons], machine.joltages), list)))
         },
         {
           use _ <- do(nibble.take_if("startjoltages", fn(tok) { tok == StartJoltages }))
@@ -257,9 +296,7 @@ pub fn main() -> Nil {
 
   // PART 2
   let part2_result = list.fold(machines, 0, fn(acc, machine) {
-    echo acc + find_fewest_button_presses_for_joltages(machine)
+    acc + find_fewest_button_presses_for_joltages(machine)
   })
   io.println("Part 2: " <> int.to_string(part2_result))
-
-  Nil
 }
